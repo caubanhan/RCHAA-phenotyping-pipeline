@@ -4,10 +4,32 @@ import pandas as pd
 import json
 from data_processing.germination_analysis import GerminationAnalyzer
 from data_processing.plant_analysis import PlantGrowthAnalyzer
+from tracking.experiment_tracker import capture_run_logs, end_run, log_metrics, start_run
 
 # ignore future warnings from pandas
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
+
+
+def load_config(path: str) -> dict:
+    """Load report generation configuration from JSON."""
+    with open(path, 'r') as f:
+        return json.load(f)
+
+
+def validate_config(config: dict) -> None:
+    """Validate required report configuration fields."""
+    if 'project_dir' not in config:
+        raise ValueError("Missing required config field: project_dir")
+
+
+def _as_bool(value) -> bool:
+    """Parse bool-like config values deterministically."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    return bool(value)
 
 def merge_analysis_files(project_dir: str, name_mapping_file: str = None) -> pd.DataFrame:
     """
@@ -78,61 +100,32 @@ def merge_analysis_files(project_dir: str, name_mapping_file: str = None) -> pd.
     
     return pd.concat(all_data, ignore_index=True)
 
-def main():
-    parser = argparse.ArgumentParser(
-        description='Post-process germination analysis results'
-    )
-    parser.add_argument(
-        '--project-dir',
-        required=True,
-        help='Project directory containing analysis folders'
-    )
-    parser.add_argument(
-        '--dt',
-        type=float,
-        default=15,
-        help='Delta time between measurements (minutes)'
-    )
-    parser.add_argument(
-        '--name-mapping',
-        type=str,
-        help='JSON file with group name mappings'
-    )
-    parser.add_argument(
-        '--add-time-before-photo',
-        type=int,
-        default=0,
-        help='Add time before first photo (in integer hours)'
-    )
-    
-    # Inside main(), update the parser:
-    parser.add_argument('--germination-time-cut', type=int, default=0)
-    parser.add_argument('--do-germination', type=str, default='True')
-    parser.add_argument('--germination-each-video', type=str, default='False')
-    parser.add_argument('--do-plant-growth', type=str, default='True')
-    parser.add_argument('--selected-metrics', type=str, default='')
-    parser.add_argument('--do-fpca', type=str, default='False')
-    parser.add_argument('--fpca-components', type=int, default=2)
-    parser.add_argument('--normalize-fpca', type=str, default='False')
+def run_pipeline(config: dict, run_path: str = None) -> None:
+    """Run report generation from configuration dictionary."""
+    project_dir = config['project_dir']
+    dt = float(config.get('dt', 15))
+    add_time_before_photo = int(config.get('add_time_before_photo', 0))
+    germination_time_cut = int(config.get('germination_time_cut', 0))
+    do_germination = _as_bool(config.get('do_germination', True))
+    store_for_each_video = _as_bool(config.get('germination_each_video', False))
+    do_plant_growth = _as_bool(config.get('do_plant_growth', True))
+    do_fpca = _as_bool(config.get('do_fpca', False))
+    fpca_components = int(config.get('fpca_components', 2))
+    normalize_fpca = _as_bool(config.get('normalize_fpca', False))
+    selected_metrics = config.get('selected_metrics', [])
+    name_mapping = config.get('name_mapping')
+    if isinstance(selected_metrics, str):
+        selected_metrics = [m for m in selected_metrics.split(',') if m]
 
-    args = parser.parse_args()
+    results_dir = os.path.join(run_path, 'results') if run_path else os.path.join(project_dir, 'results')
 
-    # Convert string booleans to actual booleans
-    do_germination = args.do_germination.lower() == 'true'
-    store_for_each_video = args.germination_each_video.lower() == 'true'
-    do_plant_growth = args.do_plant_growth.lower() == 'true'
-    do_fpca = args.do_fpca.lower() == 'true'
-    normalize_fpca = args.normalize_fpca.lower() == 'true'
-    selected_metrics = args.selected_metrics.split(',') if args.selected_metrics else []
-        
     try:
         # Setup
-        results_dir = os.path.join(args.project_dir, 'results')
         os.makedirs(results_dir, exist_ok=True)
         
         # Load and merge data with name mapping
         print("Merging analysis files...")
-        combined_data = merge_analysis_files(args.project_dir, args.name_mapping)
+        combined_data = merge_analysis_files(project_dir, name_mapping)
         combined_data.to_csv(
             os.path.join(results_dir, 'Raw_Data.tsv'),
             sep='\t',
@@ -145,10 +138,10 @@ def main():
             germ_analyzer = GerminationAnalyzer(
                 data=combined_data,
                 output_dir=results_dir,
-                dt=args.dt,
-                add_time_before_photo=args.add_time_before_photo,
+                dt=dt,
+                add_time_before_photo=add_time_before_photo,
                 store_for_each_video=store_for_each_video,
-                time_cut=args.germination_time_cut  
+                time_cut=germination_time_cut
             )
             germ_analyzer.analyze()
         
@@ -158,10 +151,10 @@ def main():
             plant_analyzer = PlantGrowthAnalyzer(
                 data=combined_data,
                 output_dir=results_dir,
-                add_time_before_photo=args.add_time_before_photo,
-                metrics=selected_metrics,           
-                do_fpca=do_fpca,                    
-                fpca_components=args.fpca_components,
+                add_time_before_photo=add_time_before_photo,
+                metrics=selected_metrics,
+                do_fpca=do_fpca,
+                fpca_components=fpca_components,
                 fpca_normalize=normalize_fpca
             )
             plant_analyzer.analyze_all_parameters()
@@ -172,6 +165,25 @@ def main():
     except Exception as e:
         print(f"Error during post-processing: {str(e)}")
         raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Post-process analysis results from JSON configuration')
+    parser.add_argument('--config', required=True, help='Path to JSON configuration file')
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    run_id, run_path = start_run(config)
+    with capture_run_logs(os.path.join(run_path, 'logs.txt')):
+        try:
+            validate_config(config)
+            run_pipeline(config, run_path=run_path)
+            log_metrics(run_id, {'status': 'report_generated'}, run_path=run_path)
+            end_run(run_id, 'completed', run_path=run_path)
+            print(f"Report experiment saved in: {run_path}")
+        except Exception as exc:
+            end_run(run_id, 'failed', run_path=run_path, error=str(exc))
+            raise
 
 if __name__ == "__main__":
     main()

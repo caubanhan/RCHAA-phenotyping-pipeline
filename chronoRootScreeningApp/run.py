@@ -315,17 +315,28 @@ class AnalysisTab(QWidget):
         enabled = self.plant_growth_checkbox.isChecked()
         self.plant_growth_widget.setVisible(enabled)
 
+    def _write_runtime_config(self, config_path, config_data):
+        """Persist runtime config for reproducible script execution."""
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        with open(config_path, 'w') as f:
+            json.dump(config_data, f, indent=4)
+
     def open_calibration_helper(self):
         """Opens a helper window to assist with manual calibration"""
         if not self.video_path_edit.text():
             QMessageBox.warning(self, 'Error', 'Please select a video directory first!')
             return
 
-        # Create command line arguments
+        project_dir = self.proj_dir_edit.text().strip() or self.video_path_edit.text().strip()
+        config_path = os.path.join(project_dir, 'runtime_configs', 'calibration_helper_config.json')
+        self._write_runtime_config(config_path, {
+            'video_dir': self.video_path_edit.text().strip()
+        })
+
         args = [
             "python",
             "calibration_helper.py",
-            "--video-dir", self.video_path_edit.text()
+            "--config", config_path
         ]
 
         try:
@@ -383,16 +394,11 @@ class AnalysisTab(QWidget):
         if not identifier:
             QMessageBox.warning(self, 'Error', 'Please provide an analysis identifier!')
             return False
-            
+
         if not identifier.replace('_', '').isalnum():
             QMessageBox.warning(self, 'Error', 'Identifier must contain only letters, numbers, and underscores!')
             return False
-            
-        analysis_dir = os.path.join(self.proj_dir_edit.text(), 'analysis', identifier)
-        if os.path.exists(analysis_dir):
-            QMessageBox.warning(self, 'Error', 'Analysis with this identifier already exists!')
-            return False
-            
+
         group_names = [entry.name_edit.text().strip() for entry in self.group_entries]
         if not all(group_names):
             QMessageBox.warning(self, 'Error', 'All group names must be filled!')
@@ -435,11 +441,7 @@ class AnalysisTab(QWidget):
         if not self.validate_inputs():
             return
                 
-        # Create analysis directory structure
         project_dir = self.proj_dir_edit.text()
-        analysis_base_dir = os.path.join(project_dir, 'analysis')
-        os.makedirs(analysis_base_dir, exist_ok=True)
-        
         identifier = self.identifier_edit.text().strip()
         
         # Get time delta, default to 15 if empty or invalid
@@ -483,45 +485,38 @@ class AnalysisTab(QWidget):
             return
         
         # Collect parameters including seed counts
+        groups = {}
+        for entry in self.group_entries:
+            group_name = entry.name_edit.text().strip()
+            groups[group_name] = entry.get_seed_count() if entry.get_seed_count() is not None else 0
+
         params = {
             'project_dir': project_dir,
             'video_dir': video_folder,
             'segmentation_dir': segmentation_dir,
             'analysis_id': identifier,
-            'has_qr': self.qr_checkbox.isChecked(),
             'show_tracking': self.show_tracking_checkbox.isChecked(),
             'time_delta': time_delta,
-            'group_names': [entry.name_edit.text().strip() for entry in self.group_entries],
-            'seed_counts': [entry.get_seed_count() for entry in self.group_entries]
+            'groups': groups
         }
         
-        # Create command line arguments
-        args = [
-            "python",
-            "process_video.py",
-            "--video-dir", params['video_dir'],
-            "--segmentation-dir", params['segmentation_dir'],
-            "--project-dir", params['project_dir'],
-            "--analysis-id", params['analysis_id'],
-            "--time-delta", str(params['time_delta'])
-        ]
-
-        # Add calibration parameters
-        if params['has_qr']:
-            args.append("--has-qr")
+        if self.qr_checkbox.isChecked():
+            params['calibration'] = {
+                'method': 'qr'
+            }
         else:
-            # Get manual calibration values
             try:
                 known_dist = float(self.known_dist_edit.text())
                 pixel_dist = int(self.pixel_dist_edit.text())
-                args.extend([
-                    "--known-distance", str(known_dist),
-                    "--pixel-distance", str(pixel_dist)
-                ])
-            except (ValueError, AttributeError) as e:
+                params['calibration'] = {
+                    'method': 'manual',
+                    'known_distance': known_dist,
+                    'pixel_distance': pixel_dist
+                }
+            except (ValueError, AttributeError):
                 QMessageBox.critical(
-                    self, 
-                    "Error", 
+                    self,
+                    "Error",
                     "Please provide valid calibration values:\n"
                     "- Known distance (mm) as a decimal number\n"
                     "- Pixel distance as a whole number\n"
@@ -529,26 +524,19 @@ class AnalysisTab(QWidget):
                 )
                 return
 
-        # Add optional flags
-        if params['show_tracking']:
-            args.append("--show-tracking")
+        config_path = os.path.join(project_dir, 'runtime_configs', 'process_video_config.json')
+        self._write_runtime_config(config_path, params)
 
-        # Add group names and their corresponding seed counts
-        group_info = []
-        for name, count in zip(params['group_names'], params['seed_counts']):
-            group_info.append(name)
-            if count is not None:
-                group_info.append(str(count))
-            else:
-                group_info.append("0")  # Use 0 to indicate no count provided
-                
-        args.extend(["--group-info"] + group_info)
+        args = [
+            "python",
+            "process_video.py",
+            "--config", config_path
+        ]
 
         try:
             # Launch the processing script
             process = subprocess.Popen(
-                " ".join(args),
-                shell=True,
+                args,
                 preexec_fn=os.setsid
             )
             
@@ -556,7 +544,7 @@ class AnalysisTab(QWidget):
                 self,
                 "Processing Started",
                 f"Video processing has been started in a separate window.\n"
-                f"Results will be saved in: {os.path.join(analysis_base_dir, identifier)}"
+                f"A new experiment folder will be created under: {os.path.join(project_dir, 'analysis')}"
             )
             
         except Exception as e:
@@ -610,15 +598,17 @@ class AnalysisTab(QWidget):
             'segmentation_dir': segmentation_dir,
             'time_delta': time_delta
         }
+
+        project_dir = self.proj_dir_edit.text().strip() or video_folder
+        config_path = os.path.join(project_dir, 'runtime_configs', 'preview_config.json')
+        self._write_runtime_config(config_path, params)
         
         
         # Create command line arguments
         args = [
             "python",
             "preview_video.py",
-            "--video-dir", params['video_dir'],
-            "--segmentation-dir", params['segmentation_dir'],
-            "--time-delta", str(params['time_delta'])
+            "--config", config_path
         ]
 
         try:
@@ -699,31 +689,46 @@ class AnalysisTab(QWidget):
         # 3. Handle Germination Cutoff
         germ_cut = self.germination_time_edit.text() or "0"
 
-        # 4. Construct Command Line Arguments
-        args = [
-            "python", "generate_report.py",
-            "--project-dir", project_dir,
-            "--dt", str(time_delta),
-            "--add-time-before-photo", str(add_time),
-            "--germination-time-cut", str(germ_cut),
-            "--do-germination", str(self.germination_checkbox.isChecked()),
-            "--germination-each-video", str(self.store_each_video_checkbox.isChecked()),
-            "--do-plant-growth", str(self.plant_growth_checkbox.isChecked()),
-            "--selected-metrics", ",".join(active_parts),
-            "--do-fpca", str(do_fpca),
-            "--fpca-components", fpca_comps,
-            "--normalize-fpca", str(self.fpca_normalize_checkbox.isChecked())
-        ]
-        
+        try:
+            germ_cut_value = int(germ_cut)
+        except ValueError:
+            germ_cut_value = 0
+
+        try:
+            fpca_components = int(fpca_comps)
+        except ValueError:
+            fpca_components = 2
+
+        report_config = {
+            'project_dir': project_dir,
+            'dt': time_delta,
+            'add_time_before_photo': add_time,
+            'germination_time_cut': germ_cut_value,
+            'do_germination': self.germination_checkbox.isChecked(),
+            'germination_each_video': self.store_each_video_checkbox.isChecked(),
+            'do_plant_growth': self.plant_growth_checkbox.isChecked(),
+            'selected_metrics': active_parts,
+            'do_fpca': do_fpca,
+            'fpca_components': fpca_components,
+            'normalize_fpca': self.fpca_normalize_checkbox.isChecked()
+        }
+
         # Add name mapping if it exists
         if os.path.exists(mapping_file):
-            args.extend(["--name-mapping", mapping_file])
+            report_config['name_mapping'] = mapping_file
+
+        config_path = os.path.join(project_dir, 'runtime_configs', 'generate_report_config.json')
+        self._write_runtime_config(config_path, report_config)
+
+        args = [
+            "python", "generate_report.py",
+            "--config", config_path
+        ]
         
         try:
             # Launch the processing script as a separate process
             process = subprocess.Popen(
-                " ".join(args),
-                shell=True,
+                args,
                 preexec_fn=os.setsid
             )
             
@@ -877,7 +882,7 @@ class ResultsTab(QWidget):
                     metadata = json.load(f)
                 # Show metadata in a message box
                 msg = QMessageBox()
-                msg.setWindowTitle(f"Metadata - {analysis_id}")
+                msg.setWindowTitle(f"Metadata - {metadata.get('run_id', analysis_id)}")
                 msg.setText("\n".join([f"{k}: {v}" for k, v in metadata.items()]))
                 msg.exec_()
             except Exception as e:
@@ -939,9 +944,13 @@ class ResultsTab(QWidget):
                         metadata = json.load(f)
                         
                     # Fill table row with color coding
-                    self.table.setItem(row, 0, self.create_table_item(metadata['analysis_id']))
-                    self.table.setItem(row, 1, self.create_table_item(', '.join(metadata['group_names'])))
-                    self.table.setItem(row, 2, self.create_table_item(str(metadata['num_groups'])))
+                    run_label = metadata.get('run_id', metadata.get('analysis_id', analysis_id))
+                    group_names = metadata.get('group_names', [])
+                    num_groups = metadata.get('num_groups', len(group_names))
+
+                    self.table.setItem(row, 0, self.create_table_item(run_label))
+                    self.table.setItem(row, 1, self.create_table_item(', '.join(group_names)))
+                    self.table.setItem(row, 2, self.create_table_item(str(num_groups)))
                     
                     # Use start_time from metadata
                     if 'start_time' in metadata:
@@ -951,12 +960,21 @@ class ResultsTab(QWidget):
                         start_time = datetime.fromtimestamp(os.path.getctime(analysis_path)).strftime("%Y-%m-%d %H:%M:%S")
                         self.table.setItem(row, 3, self.create_table_item(start_time))
                     
-                    if metadata.get('status') == 'Complete':
-                        self.table.setItem(row, 4, self.create_table_item(metadata['completion_time']))
+                    status = str(metadata.get('status', '')).lower()
+                    completion_time = metadata.get('end_time', metadata.get('completion_time', '--'))
+
+                    if status in {'completed', 'complete'}:
+                        self.table.setItem(row, 4, self.create_table_item(completion_time))
                         self.table.setItem(row, 5, self.create_table_item("Complete", "#90EE90"))  # Light green
-                    elif metadata.get('status') == 'In Progress':
+                    elif status in {'running', 'in progress'}:
                         self.table.setItem(row, 4, self.create_table_item("--"))
                         self.table.setItem(row, 5, self.create_table_item("In Progress", "#FFF68F"))  # Light yellow
+                    elif status == 'cancelled':
+                        self.table.setItem(row, 4, self.create_table_item(completion_time))
+                        self.table.setItem(row, 5, self.create_table_item("Cancelled", "#FFDAB9"))
+                    elif status == 'failed':
+                        self.table.setItem(row, 4, self.create_table_item(completion_time))
+                        self.table.setItem(row, 5, self.create_table_item("Failed", "#FFB6C1"))
                     else:
                         self.table.setItem(row, 4, self.create_table_item("--"))
                         self.table.setItem(row, 5, self.create_table_item("Unknown", "#FFB6C1"))  # Light red

@@ -20,6 +20,7 @@ from __future__ import print_function
 import os
 import numpy as np
 import matplotlib
+import json
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -252,27 +253,31 @@ class Sort(object):
       return np.concatenate(ret)
     return np.empty((0,5))
 
-def parse_args():
-    """Parse input arguments."""
-    parser = argparse.ArgumentParser(description='SORT demo')
-    parser.add_argument('--display', dest='display', help='Display online tracker output (slow) [False]',action='store_true')
-    parser.add_argument("--seq_path", help="Path to detections.", type=str, default='data')
-    parser.add_argument("--phase", help="Subdirectory in seq_path.", type=str, default='train')
-    parser.add_argument("--max_age", 
-                        help="Maximum number of frames to keep alive a track without associated detections.", 
-                        type=int, default=1)
-    parser.add_argument("--min_hits", 
-                        help="Minimum number of associated detections before track is initialised.", 
-                        type=int, default=3)
-    parser.add_argument("--iou_threshold", help="Minimum IOU for match.", type=float, default=0.3)
-    args = parser.parse_args()
-    return args
+def load_config(path):
+  """Load SORT demo configuration from JSON."""
+  with open(path, 'r') as f:
+    return json.load(f)
 
-if __name__ == '__main__':
-  # all train
-  args = parse_args()
-  display = args.display
-  phase = args.phase
+
+def validate_config(config):
+  """Validate SORT demo configuration and set defaults."""
+  config.setdefault('display', False)
+  config.setdefault('seq_path', 'data')
+  config.setdefault('phase', 'train')
+  config.setdefault('max_age', 1)
+  config.setdefault('min_hits', 3)
+  config.setdefault('iou_threshold', 0.3)
+
+
+def run_pipeline(config):
+  """Run SORT demo using configuration dictionary."""
+  display = bool(config['display'])
+  phase = config['phase']
+  seq_path = config['seq_path']
+  max_age = int(config['max_age'])
+  min_hits = int(config['min_hits'])
+  iou_threshold = float(config['iou_threshold'])
+
   total_time = 0.0
   total_frames = 0
   colours = np.random.rand(32, 3) #used only for display
@@ -286,14 +291,14 @@ if __name__ == '__main__':
 
   if not os.path.exists('output'):
     os.makedirs('output')
-  pattern = os.path.join(args.seq_path, phase, '*', 'det', 'det.txt')
+  pattern = os.path.join(seq_path, phase, '*', 'det', 'det.txt')
   for seq_dets_fn in glob.glob(pattern):
-    mot_tracker = Sort(max_age=args.max_age, 
-                       min_hits=args.min_hits,
-                       iou_threshold=args.iou_threshold) #create instance of the SORT tracker
+    mot_tracker = Sort(max_age=max_age,
+                       min_hits=min_hits,
+                       iou_threshold=iou_threshold) #create instance of the SORT tracker
     seq_dets = np.loadtxt(seq_dets_fn, delimiter=',')
     seq = seq_dets_fn[pattern.find('*'):].split(os.path.sep)[0]
-    
+
     with open(os.path.join('output', '%s.txt'%(seq)),'w') as out_file:
       print("Processing %s."%(seq))
       for frame in range(int(seq_dets[:,0].max())):
@@ -327,4 +332,12 @@ if __name__ == '__main__':
   print("Total Tracking took: %.3f seconds for %d frames or %.1f FPS" % (total_time, total_frames, total_frames / total_time))
 
   if(display):
-    print("Note: to get real runtime results run without the option: --display")
+    print("Note: to get real runtime results run without the option: display=true")
+
+if __name__ == '__main__':
+  parser = argparse.ArgumentParser(description='SORT demo with JSON configuration')
+  parser.add_argument('--config', required=True, help='Path to JSON configuration file')
+  cli_args = parser.parse_args()
+  cfg = load_config(cli_args.config)
+  validate_config(cfg)
+  run_pipeline(cfg)

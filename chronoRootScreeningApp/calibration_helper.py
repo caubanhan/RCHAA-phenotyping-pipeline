@@ -8,8 +8,29 @@ from PyQt5.QtCore import Qt, pyqtSignal, QPoint
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor
 import argparse
 import PIL.Image
+import json
 
 from typing import List, Tuple
+
+
+def load_config(path: str) -> dict:
+    """Load calibration helper configuration from JSON."""
+    with open(path, 'r') as f:
+        return json.load(f)
+
+
+def validate_config(config: dict) -> None:
+    """Validate required calibration helper fields."""
+    if 'video_dir' not in config:
+        raise ValueError("Missing required config field: video_dir")
+
+
+def run_pipeline(config: dict) -> None:
+    """Run calibration helper UI from config dictionary."""
+    app = QApplication(sys.argv)
+    ex = CalibrationHelper(config['video_dir'])
+    ex.show()
+    sys.exit(app.exec_())
 
 def loadPath(path: str, ext: str = "*") -> List[str]:
     """
@@ -299,14 +320,13 @@ class CalibrationHelper(QMainWindow):
             self.statusBar().showMessage('Please select two points first')
 
 def main():
-    parser = argparse.ArgumentParser(description='Video Calibration Helper')
-    parser.add_argument('--video-dir', required=True, help='Directory containing video files')
+    parser = argparse.ArgumentParser(description='Video Calibration Helper from JSON configuration')
+    parser.add_argument('--config', required=True, help='Path to JSON configuration file')
     args = parser.parse_args()
-    
-    app = QApplication(sys.argv)
-    ex = CalibrationHelper(args.video_dir)
-    ex.show()
-    sys.exit(app.exec_())
+
+    config = load_config(args.config)
+    validate_config(config)
+    run_pipeline(config)
 
 if __name__ == '__main__':
     main()

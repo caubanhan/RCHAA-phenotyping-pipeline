@@ -5,7 +5,6 @@ import numpy as np
 import cv2
 from sort import Sort
 import pandas as pd
-import argparse
 from datetime import datetime
 from typing import Dict, Any, Tuple, List
 import matplotlib
@@ -13,12 +12,24 @@ import sys
 from qr import qr_detect, get_pixel_size
 from collections import defaultdict
 matplotlib.use('Agg')
+from tracking.experiment_tracker import capture_run_logs, end_run, log_metrics, start_run
 
 from skimage.morphology import skeletonize
-
+import argparse
 # ignore future warnings from pandas
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
+
+
+def load_config(path: str) -> Dict[str, Any]:
+    """Load configuration from a JSON file."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Configuration file not found: {path}")
+
+    with open(path, 'r') as f:
+        return json.load(f)
+
+
 
 class GroupROISelector:
     def __init__(self, image_path: str, group_names: List[str]):
@@ -226,10 +237,6 @@ def process_video(params: Dict[str, Any]):
     if params['show_tracking']:
         os.makedirs(vis_dir, exist_ok=True)
         
-    # Save initial metadata
-    start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    save_metadata(analysis_dir, params, start_time=start_time)
-
     # Save a json file with the group information
     group_info = {
         'group_names': params['group_names'],
@@ -510,21 +517,17 @@ def process_video(params: Dict[str, Any]):
     results_path = os.path.join(analysis_dir, 'seeds.tsv')
     dataframe.to_csv(results_path, sep='\t', index=False)
 
-    # Update metadata
-    completion_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    save_metadata(analysis_dir, params, completion_time=completion_time)
-
     print(f"Results saved in: {results_path}")
 
     return dataframe
 
 
-def validate_directories(video_dir: str, project_dir: str):
+def validate_directories(video_dir: str, segmentation_dir: str, project_dir: str):
     """Validate directory structure and files."""
     if not os.path.exists(video_dir):
         raise ValueError(f"Video directory does not exist: {video_dir}")
     
-    seg_dir = os.path.join(video_dir, "Segmentation", "Ensemble")
+    seg_dir = os.path.join(segmentation_dir, "Ensemble")
     if not os.path.exists(seg_dir):
         raise ValueError(f"Segmentation directory not found: {seg_dir}")
     
@@ -545,81 +548,163 @@ def validate_directories(video_dir: str, project_dir: str):
         
     return True
 
-def main():
-    parser = argparse.ArgumentParser(description='Process seed tracking video')
-    # Required arguments
-    parser.add_argument('--video-dir', required=True, help='Directory containing the video frames')
-    parser.add_argument('--segmentation-dir', required=True, help='Directory containing segmentation masks')
-    parser.add_argument('--project-dir', required=True, help='Project directory for output')
-    parser.add_argument('--analysis-id', required=True, help='Unique identifier for this analysis')
 
-    # Calibration arguments (mutually exclusive)
-    calib_group = parser.add_mutually_exclusive_group(required=True)
-    calib_group.add_argument('--has-qr', action='store_true', help='Use QR code for calibration')
-    calib_group.add_argument('--known-distance', type=float, help='Known physical distance in mm')
+def validate_config(config: Dict[str, Any]) -> None:
+    """Validate required config fields and value shapes."""
+    required_fields = [
+        'video_dir',
+        'segmentation_dir',
+        'project_dir',
+        'analysis_id',
+        'groups',
+        'calibration'
+    ]
+    missing_fields = [field for field in required_fields if field not in config]
+    if missing_fields:
+        raise ValueError(f"Missing required config fields: {', '.join(missing_fields)}")
 
-    # Only required if using manual calibration
-    parser.add_argument('--pixel-distance', type=int, 
-                    help='Pixel distance corresponding to known physical distance')
+    groups = config['groups']
+    if not isinstance(groups, dict) or not groups:
+        raise ValueError("'groups' must be a non-empty dictionary mapping group names to seed counts")
 
-    # Optional arguments
-    parser.add_argument('--time-delta', type=float, default=15,
-                    help='Time between slices in minutes')
-    parser.add_argument('--show-tracking', action='store_true',
-                    help='Flag to show tracking visualization')
+    for group_name, count in groups.items():
+        if not isinstance(group_name, str) or not group_name.strip():
+            raise ValueError("All group names must be non-empty strings")
+        if not isinstance(count, int):
+            raise ValueError(f"Group '{group_name}' seed count must be an integer")
 
-    # Group information (alternating name and count)
-    parser.add_argument('--group-info', nargs='+', required=True,
-                    help='Alternating group names and seed counts (e.g., "GroupA" "10" "GroupB" "15")')
+    calibration = config['calibration']
+    if not isinstance(calibration, dict):
+        raise ValueError("'calibration' must be a dictionary")
 
-    args = parser.parse_args()
+    method = calibration.get('method')
+    if method not in {'qr', 'manual'}:
+        raise ValueError("calibration.method must be either 'qr' or 'manual'")
 
-    # Validate manual calibration parameters
-    if not args.has_qr and args.pixel_distance is None:
-        parser.error("--pixel-distance is required when using manual calibration")
+    if method == 'manual':
+        if 'known_distance' not in calibration or 'pixel_distance' not in calibration:
+            raise ValueError("Manual calibration requires calibration.known_distance and calibration.pixel_distance")
 
-    # Process group info into names and counts
-    if len(args.group_info) % 2 != 0:
-        parser.error("--group-info must have pairs of names and counts")
-        
-    group_names = args.group_info[::2]  # Even indices are names
-    seed_counts = [int(count) for count in args.group_info[1::2]]  # Odd indices are counts
+    validate_directories(config['video_dir'], config['segmentation_dir'], config['project_dir'])
 
-    # Build parameters dictionary
+
+def run_pipeline(config: Dict[str, Any]):
+    """Run processing pipeline from a validated config dictionary."""
+    calibration = config['calibration']
+    group_names = list(config['groups'].keys())
+    seed_counts = list(config['groups'].values())
+
     params = {
-        'video_dir': args.video_dir,
-        'segmentation_dir': args.segmentation_dir,
-        'project_dir': args.project_dir,
-        'analysis_id': args.analysis_id,
-        'time_delta': args.time_delta,
-        'has_qr': args.has_qr,
-        'show_tracking': args.show_tracking,
+        'video_dir': config['video_dir'],
+        'segmentation_dir': config['segmentation_dir'],
+        'project_dir': config['project_dir'],
+        'analysis_id': config['analysis_id'],
+        'time_delta': float(config.get('time_delta', 15)),
+        'show_tracking': bool(config.get('show_tracking', False)),
+        'has_qr': calibration['method'] == 'qr',
         'group_names': group_names,
         'seed_counts': seed_counts
     }
 
-    # Add calibration parameters if using manual calibration
-    if not args.has_qr:
-        params['known_distance'] = args.known_distance
-        params['pixel_distance'] = args.pixel_distance
+    if calibration['method'] == 'manual':
+        params['known_distance'] = float(calibration['known_distance'])
+        params['pixel_distance'] = float(calibration['pixel_distance'])
 
+    print(f"Starting analysis: {params['analysis_id']}")
+    print("Groups to analyze:")
+    for name, count in zip(group_names, seed_counts):
+        print(f"  - {name}: {count} seeds")
+
+    if params['has_qr']:
+        print("Using QR code calibration")
+    else:
+        print(f"Using manual calibration: {params['known_distance']}mm = {params['pixel_distance']}px")
+
+    return process_video(params)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Process seed tracking video with JSON configuration',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Example usage:
+    python process_video.py --config config.json
+
+Configuration file structure (config.json):
+{
+    "video_dir": "/path/to/video/frames",
+    "segmentation_dir": "/path/to/segmentation",
+    "project_dir": "/path/to/project",
+    "analysis_id": "experiment_001",
+    "time_delta": 15,
+    "show_tracking": true,
+    "calibration": {
+        "method": "manual",
+        "known_distance": 50,
+        "pixel_distance": 800
+    },
+    "groups": {
+        "group_1": 10,
+        "group_2": 12,
+        "group_3": 8
+    }
+}
+
+Use calibration.method="qr" to enable QR code calibration.
+"""
+    )
+    
+    parser.add_argument(
+        '--config',
+        required=True,
+        help='Path to JSON configuration file'
+    )
+    
+    args = parser.parse_args()
+    
     try:
-        print(f"Starting analysis: {params['analysis_id']}")
-        print("Groups to analyze:")
-        for name, count in zip(group_names, seed_counts):
-            print(f"  - {name}: {count} seeds")
+        # Load configuration from JSON
+        config = load_config(args.config)
+        run_id, run_path = start_run(config)
+
+        with capture_run_logs(os.path.join(run_path, 'logs.txt')):
+            try:
+                validate_config(config)
+                original_analysis_id = config.get('analysis_id')
+                config['analysis_label'] = original_analysis_id
+                config['analysis_id'] = run_id
+
+                df = run_pipeline(config)
+
+                metrics = {
+                    'rows': int(len(df)) if df is not None else 0,
+                }
+                log_metrics(run_id, metrics, run_path=run_path)
+                status = 'completed' if df is not None else 'cancelled'
+                end_run(run_id, status, run_path=run_path)
+
+                if df is not None:
+                    print("\nProcessing completed successfully")
+                    print(f"Results saved in: {run_path}")
+                else:
+                    print("Processing was cancelled")
+            except Exception as exc:
+                end_run(run_id, 'failed', run_path=run_path, error=str(exc))
+                raise
             
-        if args.has_qr:
-            print("Using QR code calibration")
-        else:
-            print(f"Using manual calibration: {args.known_distance}mm = {args.pixel_distance}px")
-            
-        df = process_video(params)
-        print("\nProcessing completed successfully")
-        print(f"Results saved in: {os.path.join(params['project_dir'], 'analysis', params['analysis_id'])}")
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON in configuration file: {e}")
+        sys.exit(1)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
     except Exception as e:
         print(f"Error during processing: {e}")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

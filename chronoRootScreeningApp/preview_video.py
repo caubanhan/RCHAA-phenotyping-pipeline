@@ -4,7 +4,22 @@ import numpy as np
 import argparse
 import os
 import sys
+import json
 from typing import List, Tuple
+
+
+def load_config(path: str) -> dict:
+    """Load preview configuration from JSON."""
+    with open(path, 'r') as f:
+        return json.load(f)
+
+
+def validate_config(config: dict) -> None:
+    """Validate required preview configuration fields."""
+    required = ['video_dir', 'segmentation_dir']
+    missing = [key for key in required if key not in config]
+    if missing:
+        raise ValueError(f"Missing required config fields: {', '.join(missing)}")
 
 def loadPath(path: str, ext: str = "*") -> List[str]:
     """
@@ -119,19 +134,25 @@ def preview_sequence(video_dir: str, segmentation_dir: str, time_delta: float = 
     
     cv2.destroyAllWindows()
 
+
+def run_pipeline(config: dict) -> None:
+    """Run preview from config dictionary."""
+    preview_sequence(
+        video_dir=config['video_dir'],
+        segmentation_dir=config['segmentation_dir'],
+        time_delta=float(config.get('time_delta', 60.0))
+    )
+
 def main():
-    parser = argparse.ArgumentParser(description='Preview video sequence from images')
-    parser.add_argument('--video-dir', required=True,
-                      help='Directory containing the image sequence')
-    parser.add_argument('--segmentation-dir', required=True,
-                      help='Directory containing the segmentation images')
-    parser.add_argument('--time-delta', type=float, default=60.0,
-                      help='Time in seconds between frames (default: 60)')
+    parser = argparse.ArgumentParser(description='Preview video sequence from JSON configuration')
+    parser.add_argument('--config', required=True, help='Path to JSON configuration file')
     
     args = parser.parse_args()
     
     try:
-        preview_sequence(args.video_dir, args.segmentation_dir, args.time_delta)
+        config = load_config(args.config)
+        validate_config(config)
+        run_pipeline(config)
     except Exception as e:
         print(f"Error during preview: {str(e)}", file=sys.stderr)
         sys.exit(1)
